@@ -49,6 +49,7 @@ class DownloadAndLoadEasyAnimateModel:
                     ], {
                         "default": 'bf16'
                     }),
+            "low_gpu_memory_mode": ("BOOLEAN", {"default": False}),
             },
         }
 
@@ -57,7 +58,7 @@ class DownloadAndLoadEasyAnimateModel:
     FUNCTION = "loadmodel"
     CATEGORY = "EasyAnimateWrapper"
 
-    def loadmodel(self, precision, model):
+    def loadmodel(self, precision, model, low_gpu_memory_mode):
         device = mm.get_torch_device()
         mm.soft_empty_cache()
         dtype = {"bf16": torch.bfloat16, "fp16": torch.float16, "fp32": torch.float32}[precision]
@@ -128,7 +129,7 @@ class DownloadAndLoadEasyAnimateModel:
             clip_image_encoder=clip_image_encoder,
             clip_image_processor=clip_image_processor,
         )
-        low_gpu_memory_mode = True
+
         if low_gpu_memory_mode:
             pipeline.enable_sequential_cpu_offload()
         else:
