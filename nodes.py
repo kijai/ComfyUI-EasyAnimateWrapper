@@ -12,7 +12,7 @@ from diffusers import (AutoencoderKL, DDIMScheduler,
                        PNDMScheduler)
 from omegaconf import OmegaConf
 from transformers import CLIPVisionModelWithProjection,  CLIPImageProcessor, T5EncoderModel, T5Tokenizer
-from torchvision.transforms import Resize
+
 from .easyanimate.models.autoencoder_magvit import AutoencoderKLMagvit
 from .easyanimate.models.transformer3d import Transformer3DModel
 from .easyanimate.pipeline.pipeline_easyanimate_inpaint import EasyAnimateInpaintPipeline
@@ -195,11 +195,15 @@ class EasyAnimateSampler:
             print("input_video: ", input_video.shape)
             input_video_mask = torch.zeros_like(input_video[:, :1])
             input_video_mask[:, :, 1:, ] = 255
-        
- 
-        if image_end is not None:
-            input_video[:, :, -1:] = image_end.permute(0, 3, 1, 2).unsqueeze(2).to(device)
-            input_video_mask[:, :, -1:] = 0
+
+            if image_end is not None:
+                input_video[:, :, -1:] = image_end.permute(0, 3, 1, 2).unsqueeze(2).to(device)
+                input_video_mask[:, :, -1:] = 0
+        else:
+            input_video = torch.zeros([1, 3, video_length, height, width])
+            input_video_mask = torch.ones([1, 1, video_length, height, width]) * 255
+            clip_image = None
+
 
         generator = torch.Generator(device=device).manual_seed(seed)
 
@@ -233,9 +237,9 @@ class EasyAnimateSampler:
             guidance_scale = cfg,
             num_inference_steps = steps,
 
-            video        = input_video,
+            video= input_video,
             mask_video   = input_video_mask,
-            clip_image   = clip_image, 
+            clip_image   = clip_image,
         ).videos
 
         if not keep_model_loaded:
