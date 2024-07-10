@@ -1,0 +1,11 @@
+Pillow
+einops
+timm
+accelerate
+numpy
+opencv-python
+omegaconf
+SentencePiece
+ftfy
+diffusers>=0.28.2
+transformers
