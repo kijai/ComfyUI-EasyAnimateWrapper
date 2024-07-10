@@ -259,8 +259,6 @@ class EasyAnimateTextEncode:
                 "easyanimate_pipeline": ("EASYANIMATEPIPE", ),
                 "prompt": ("STRING", {"multiline": True, "default": "",}),
                 "negative_prompt": ("STRING", {"multiline": True, "default": "",}),
-                "num_images_per_prompt": ("INT", {"default": 1, "min": 1, "max": 128, "step": 1}),
-                "clean_caption": ("BOOLEAN", {"default": True}),
             },
         }
     
@@ -269,9 +267,8 @@ class EasyAnimateTextEncode:
     FUNCTION = "encode"
     CATEGORY = "EasyAnimateWrapper"
     
-    def encode(self, easyanimate_pipeline, prompt, negative_prompt, num_images_per_prompt, clean_caption):
+    def encode(self, easyanimate_pipeline, prompt, negative_prompt):
         device = mm.get_torch_device()
-        offload_device = mm.unet_offload_device()
         
         mm.unload_all_models()
         mm.soft_empty_cache()
@@ -289,8 +286,7 @@ class EasyAnimateTextEncode:
             batch_size = prompt_embeds.shape[0]
 
         max_length = 120
-        
-        
+        clean_caption = False
         prompt = EasyAnimateInpaintPipeline._text_preprocessing(self, prompt, clean_caption=clean_caption)
         text_inputs = self.tokenizer(
             prompt,
@@ -319,14 +315,6 @@ class EasyAnimateTextEncode:
         prompt_embeds = prompt_embeds[0]
 
         prompt_embeds = prompt_embeds.to(dtype=dtype, device=device)
-
-        bs_embed, seq_len, _ = prompt_embeds.shape
-        # duplicate text embeddings and attention mask for each generation per prompt, using mps friendly method
-        prompt_embeds = prompt_embeds.repeat(1, num_images_per_prompt, 1)
-        prompt_embeds = prompt_embeds.view(bs_embed * num_images_per_prompt, seq_len, -1)
-        prompt_attention_mask = prompt_attention_mask.view(bs_embed, -1)
-        prompt_attention_mask = prompt_attention_mask.repeat(num_images_per_prompt, 1)
-
        
         uncond_tokens = [negative_prompt] * batch_size
         uncond_tokens = EasyAnimateInpaintPipeline._text_preprocessing(self, uncond_tokens, clean_caption=clean_caption)
@@ -348,16 +336,7 @@ class EasyAnimateTextEncode:
         )
         negative_prompt_embeds = negative_prompt_embeds[0]
 
-        # duplicate unconditional embeddings for each generation per prompt, using mps friendly method
-        seq_len = negative_prompt_embeds.shape[1]
-
         negative_prompt_embeds = negative_prompt_embeds.to(dtype=dtype, device=device)
-
-        negative_prompt_embeds = negative_prompt_embeds.repeat(1, num_images_per_prompt, 1)
-        negative_prompt_embeds = negative_prompt_embeds.view(batch_size * num_images_per_prompt, seq_len, -1)
-
-        negative_prompt_attention_mask = negative_prompt_attention_mask.view(bs_embed, -1)
-        negative_prompt_attention_mask = negative_prompt_attention_mask.repeat(num_images_per_prompt, 1)
         
         #self.text_encoder.to(offload_device)
         mm.soft_empty_cache()
@@ -403,22 +382,24 @@ class EasyAnimateDecode:
                 video = self.vae.decode(latents)[0]
             else:
                 video = []
+                pbar = comfy.utils.ProgressBar(latents.shape[2])
                 for i in range(0, latents.shape[2], mini_batch_decoder):
                     with torch.no_grad():
                         start_index = i
                         end_index = i + mini_batch_decoder
                         latents_bs = self.vae.decode(latents[:, :, start_index:end_index, :, :])[0]
                         video.append(latents_bs)
+                        pbar.update(1)
                 video = torch.cat(video, 2)
             video = video.clamp(-1, 1)
             video = EasyAnimateInpaintPipeline.smooth_output(self, video, mini_batch_encoder, mini_batch_decoder).cpu().clamp(-1, 1)
         else:
             latents = rearrange(latents, "b c f h w -> (b f) c h w")
             video = []
-            pbar = comfy.utils.ProgressBar(latents.shape[0])
+            
             for frame_idx in tqdm(range(latents.shape[0])):
                 video.append(self.vae.decode(latents[frame_idx:frame_idx+1]).sample)
-                pbar.update(1)
+                
             video = torch.cat(video)
             video = rearrange(video, "(b f) c h w -> b c f h w", f=video_length)
         video = (video / 2 + 0.5).clamp(0, 1)
