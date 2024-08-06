@@ -1,23 +1,20 @@
 import os
 import torch
 import gc
-from einops import rearrange
 import folder_paths
 import comfy.model_management as mm
 import comfy.utils
-from tqdm import tqdm
-from diffusers import (AutoencoderKL, DDIMScheduler,
+from diffusers import (DDIMScheduler,
                        DPMSolverMultistepScheduler,
                        EulerAncestralDiscreteScheduler, EulerDiscreteScheduler,
                        PNDMScheduler)
 from omegaconf import OmegaConf
-from transformers import CLIPVisionModelWithProjection,  CLIPImageProcessor, T5EncoderModel, T5Tokenizer
+from transformers import CLIPVisionModelWithProjection, CLIPImageProcessor
 
 from .easyanimate.models.autoencoder_magvit import AutoencoderKLMagvit
 from .easyanimate.models.transformer3d import Transformer3DModel
 from .easyanimate.pipeline.pipeline_easyanimate_inpaint import EasyAnimateInpaintPipeline
-from .easyanimate.utils.lora_utils import merge_lora, unmerge_lora
-from .easyanimate.utils.utils import save_videos_grid, get_image_to_video_latent
+from .easyanimate.aspect_ratios import ASPECT_RATIO_512, get_closest_ratio
 
 script_directory = os.path.dirname(os.path.abspath(__file__))
 
@@ -28,7 +25,6 @@ try:
     is_accelerate_available = True
 except:
     pass
-
 
 class DownloadAndLoadEasyAnimateModel:
     @classmethod
@@ -86,7 +82,7 @@ class DownloadAndLoadEasyAnimateModel:
             print(f"Downloading model to: {common_path}")
             from huggingface_hub import snapshot_download
             snapshot_download(repo_id=f"alibaba-pai/EasyAnimateV3-XL-2-InP-768x768", 
-                                ignore_patterns=["transformer/*"],
+                                ignore_patterns=["transformer/*","text_encoder/*"],
                                 local_dir=common_path, 
                                 local_dir_use_symlinks=False)
 
@@ -106,24 +102,17 @@ class DownloadAndLoadEasyAnimateModel:
 
         pbar.update(1)
 
-        if OmegaConf.to_container(config['vae_kwargs'])['enable_magvit']:
-            Choosen_AutoencoderKL = AutoencoderKLMagvit
-        else:
-            Choosen_AutoencoderKL = AutoencoderKL
-        vae = Choosen_AutoencoderKL.from_pretrained(common_path, subfolder="vae").to(dtype)
+        vae = AutoencoderKLMagvit.from_pretrained(common_path, subfolder="vae").to(dtype)
+        vae.upcast_vae = True
 
         clip_image_encoder = CLIPVisionModelWithProjection.from_pretrained(common_path, subfolder="image_encoder").to(device, dtype)
         clip_image_processor = CLIPImageProcessor.from_pretrained(common_path, subfolder="image_encoder")
-        self.tokenizer = T5Tokenizer.from_pretrained(common_path, subfolder="tokenizer")
-        self.text_encoder = T5EncoderModel.from_pretrained(common_path, subfolder="text_encoder", torch_dtype=dtype)
 
         pbar.update(1)
 
         scheduler = DPMSolverMultistepScheduler(**OmegaConf.to_container(config['noise_scheduler_kwargs']))
         pipeline = EasyAnimateInpaintPipeline(
             vae=vae,
-            tokenizer = self.tokenizer,
-            text_encoder = self.text_encoder,
             transformer=self.transformer,
             scheduler=scheduler,
             clip_image_encoder=clip_image_encoder,
@@ -137,20 +126,56 @@ class DownloadAndLoadEasyAnimateModel:
         
         pipeline_dict = {
             'pipeline': pipeline,
-            'dtype': dtype
+            'dtype': dtype,
+            'model_name': model,
+            'model_path': common_path,
         }
         pbar.update(1)
         return (pipeline_dict,)
+    
+class EasyAnimateTextEncode:
+    @classmethod
+    def INPUT_TYPES(s):
+        return {"required": {
+            "clip": ("CLIP",),
+            "prompt": ("STRING", {"default": "", "multiline": True} ),
+            }
+        }
+
+    RETURN_TYPES = ("CONDITIONING",)
+    RETURN_NAMES = ("conditioning",)
+    FUNCTION = "process"
+    CATEGORY = "CogVideoWrapper"
+
+    def process(self, clip, prompt):
+        device = mm.get_torch_device()
+        offload_device = mm.unet_offload_device()
+        clip.tokenizer.t5xxl.pad_to_max_length = True
+        clip.tokenizer.t5xxl.truncation = True
+        clip.tokenizer.t5xxl.max_length = 120
+        clip.cond_stage_model.t5xxl.return_attention_masks = True
+        clip.cond_stage_model.t5xxl.use_attention_masks = True
+        tokens = clip.tokenize(prompt.lower().strip(), return_word_ids=True)["t5xxl"]
+        clip.cond_stage_model.t5xxl.to(device)
+        embeds, _, attention_mask = clip.cond_stage_model.t5xxl.encode_token_weights(tokens)
+        clip.cond_stage_model.t5xxl.to(offload_device)
+        embeds = {
+            "embeds": embeds,
+            "attention_mask": attention_mask['attention_mask']
+        }
+
+        return (embeds, )
         
 class EasyAnimateSampler:
     @classmethod
     def INPUT_TYPES(s):
         return {"required": {
             "easyanimate_pipeline": ("EASYANIMATEPIPE",),
-            "easyanimate_embeds": ("T5EMBEDS", {"default": None}),
+            "positive": ("CONDITIONING", ),
+            "negative": ("CONDITIONING", ),
             "width": ("INT", {"default": 384, "min": 64, "max": 2048, "step": 8}),
             "height": ("INT", {"default": 672, "min": 64, "max": 2048, "step": 8}),
-            "frames": ("INT", {"default": 16, "min": 1, "max": 200, "step": 1}),
+            "frames": ("INT", {"default": 16, "min": 8, "max": 144, "step": 8}),
             "steps": ("INT", {"default": 20, "min": 1, "max": 200, "step": 1}),
             "cfg": ("FLOAT", {"default": 7.0, "min": 0.0, "max": 20.0, "step": 0.01}),
             "seed": ("INT", {"default": 0, "min": 0, "max": 0xffffffffffffffff}),
@@ -176,7 +201,7 @@ class EasyAnimateSampler:
     FUNCTION = "process"
     CATEGORY = "EasyAnimateWrapper"
 
-    def process(self, easyanimate_pipeline, easyanimate_embeds, width, height, frames, cfg, steps, seed, scheduler, keep_model_loaded, 
+    def process(self, easyanimate_pipeline, positive, negative, width, height, frames, cfg, steps, seed, scheduler, keep_model_loaded, 
                 image_start=None, image_end=None):
         device = mm.get_torch_device()
         offload_device = mm.unet_offload_device()
@@ -184,64 +209,78 @@ class EasyAnimateSampler:
         mm.soft_empty_cache()
         dtype = easyanimate_pipeline['dtype']
         pipeline = easyanimate_pipeline['pipeline']
+        
+
+        model_name = easyanimate_pipeline['model_name']
+        if "512" in model_name:
+            base_resolution = 512
+        elif "768" in model_name:
+            base_resolution = 768
+        elif "960" in model_name:
+            base_resolution = 960
+
         vae = pipeline.vae
         video_length = int(frames // vae.mini_batch_encoder * vae.mini_batch_encoder) if frames != 1 else 1
 
         if image_start is not None:
+            B, H, W, C = image_start.shape
             image_start = clip_image = image_start.permute(0, 3, 1, 2).to(device)
+            aspect_ratio_sample_size    = {key : [x / 512 * base_resolution for x in ASPECT_RATIO_512[key]] for key in ASPECT_RATIO_512.keys()}
+            closest_size, closest_ratio = get_closest_ratio(H, W, ratios=aspect_ratio_sample_size)
+            height, width = [int(x / 16) * 16 for x in closest_size]
+            print("closest size: ", closest_size, " closest ratio: ", closest_ratio, " height: ", height, " width: ", width)
+
+            pixels = comfy.utils.common_upscale(image_start, width, height, "lanczos", "disabled")
+
             input_video = torch.tile(
-            image_start.unsqueeze(2),  # Permute B, H, W, C to B, C, H, W and unsqueeze T
+            pixels.unsqueeze(2),  # Permute B, H, W, C to B, C, H, W and unsqueeze T
             [1, 1, video_length, 1, 1]
             )
             print("input_video: ", input_video.shape)
             input_video_mask = torch.zeros_like(input_video[:, :1])
-            input_video_mask[:, :, 1:, ] = 255
+            input_video_mask[:, :, 1:] = 1
 
             if image_end is not None:
                 input_video[:, :, -1:] = image_end.permute(0, 3, 1, 2).unsqueeze(2).to(device)
                 input_video_mask[:, :, -1:] = 0
         else:
             input_video = torch.zeros([1, 3, video_length, height, width])
-            input_video_mask = torch.ones([1, 1, video_length, height, width]) * 255
+            input_video_mask = torch.ones([1, 1, video_length, height, width])
             clip_image = None
 
 
         generator = torch.Generator(device=device).manual_seed(seed)
-
-        noise_scheduler_kwargs = {
-            "beta_start": 0.0001,
-            "beta_end": 0.02,
-            "beta_schedule": "linear",
-            "steps_offset": 1
-        }
-
-        Choosen_Scheduler = {
+        model_path = easyanimate_pipeline['model_path']
+        scheduler_classes = {
+            "DPMSolverMultistepScheduler": DPMSolverMultistepScheduler,
             "EulerDiscreteScheduler": EulerDiscreteScheduler,
             "EulerAncestralDiscreteScheduler": EulerAncestralDiscreteScheduler,
-            "DPMSolverMultistepScheduler": DPMSolverMultistepScheduler, 
             "PNDMScheduler": PNDMScheduler,
             "DDIMScheduler": DDIMScheduler,
-        }[scheduler]
-        pipeline.scheduler = Choosen_Scheduler(**noise_scheduler_kwargs)
+        }
+
+        if scheduler in scheduler_classes:
+            noise_scheduler = scheduler_classes[scheduler].from_pretrained(model_path, subfolder='scheduler')
+        else:
+            raise ValueError(f"Unknown scheduler: {scheduler}")
+
+        pipeline.scheduler = noise_scheduler
 
         sample = pipeline(
-            prompt = None, 
             video_length = video_length,
-            negative_prompt = None,
-            prompt_embeds = easyanimate_embeds['prompt_embeds'],
-            prompt_attention_mask = easyanimate_embeds['prompt_attention_mask'],
-            negative_prompt_embeds = easyanimate_embeds['negative_prompt_embeds'],
-            negative_prompt_attention_mask = easyanimate_embeds['negative_prompt_attention_mask'],
-            height      = height,
-            width       = width,
-            generator   = generator,
+            prompt_embeds = positive["embeds"].to(dtype).to(device),
+            prompt_attention_mask = positive["attention_mask"].to(dtype).to(device),
+            negative_prompt_embeds = negative["embeds"].to(dtype).to(device),
+            negative_prompt_attention_mask = negative["attention_mask"].to(dtype).to(device),
+            height = height,
+            width = width,
+            generator = generator,
             guidance_scale = cfg,
             num_inference_steps = steps,
-
-            video= input_video,
-            mask_video   = input_video_mask,
-            clip_image   = clip_image,
-        ).videos
+            video = input_video,
+            mask_video = input_video_mask,
+            clip_image = clip_image,
+        )
 
         if not keep_model_loaded:
             pipeline.unet.to(offload_device)
@@ -251,7 +290,7 @@ class EasyAnimateSampler:
 
         return sample,
 
-class EasyAnimateTextEncode:
+class EasyAnimateTextEncodeOrig:
     @classmethod
     def INPUT_TYPES(s):
         return {
@@ -262,8 +301,8 @@ class EasyAnimateTextEncode:
             },
         }
     
-    RETURN_TYPES = ("T5EMBEDS",)
-    RETURN_NAMES =("easyanimate_embeds",)
+    RETURN_TYPES = ("CONDITIONING", "CONDITIONING")
+    RETURN_NAMES =("conditioning", "negative_conditioning")
     FUNCTION = "encode"
     CATEGORY = "EasyAnimateWrapper"
     
@@ -341,14 +380,17 @@ class EasyAnimateTextEncode:
         #self.text_encoder.to(offload_device)
         mm.soft_empty_cache()
         gc.collect()
-        t5_embeds = {
-            'prompt_embeds': prompt_embeds,
-            'prompt_attention_mask': prompt_attention_mask,
-            'negative_prompt_embeds': negative_prompt_embeds,
-            'negative_prompt_attention_mask': negative_prompt_attention_mask
+
+        pos_embeds = {
+            'embeds': prompt_embeds,
+            'attention_mask': prompt_attention_mask,
+        }
+        neg_embeds = {
+            'embeds': negative_prompt_embeds,
+            'attention_mask': negative_prompt_attention_mask
         }
         
-        return (t5_embeds,)
+        return (pos_embeds, neg_embeds)
     
 class EasyAnimateDecode:
     @classmethod
@@ -373,7 +415,6 @@ class EasyAnimateDecode:
         mm.soft_empty_cache()
         self.vae = easyanimate_pipeline['pipeline'].vae
 
-        video_length = latents.shape[2]
         latents = 1 / self.vae.config.scaling_factor * latents
         if self.vae.quant_conv.weight.ndim==5:
             mini_batch_encoder = self.vae.mini_batch_encoder
@@ -393,17 +434,8 @@ class EasyAnimateDecode:
                 video = torch.cat(video, 2)
             video = video.clamp(-1, 1)
             video = EasyAnimateInpaintPipeline.smooth_output(self, video, mini_batch_encoder, mini_batch_decoder).cpu().clamp(-1, 1)
-        else:
-            latents = rearrange(latents, "b c f h w -> (b f) c h w")
-            video = []
-            
-            for frame_idx in tqdm(range(latents.shape[0])):
-                video.append(self.vae.decode(latents[frame_idx:frame_idx+1]).sample)
-                
-            video = torch.cat(video)
-            video = rearrange(video, "(b f) c h w -> b c f h w", f=video_length)
-        video = (video / 2 + 0.5).clamp(0, 1)
 
+        video = (video / 2 + 0.5).clamp(0, 1)
         video = video.squeeze(0).permute(1, 2, 3, 0).cpu().float()
         return (video,)
 
