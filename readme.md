@@ -1,5 +1,15 @@
 # WORK IN PROGRESS
+## Update:
+Switched the text encoder to use the Comfy native T5 loader as the model is same that's used with SD3 and Flux.
+It can be downloaded from the Manager, or from here, to `ComfyUI/models/clip`:
 
+fp16: https://huggingface.co/mcmonkey/google_t5-v1_1-xxl_encoderonly/blob/main/pytorch_model.safetensors
+
+fp8: https://huggingface.co/mcmonkey/google_t5-v1_1-xxl_encoderonly/blob/main/t5xxl_fp8_e4m3fn.safetensors
+
+
+
+https://github.com/user-attachments/assets/a9e479dd-83fa-4558-abce-0d533210c66e
 
 Everything should be autodownloaded, but for manual install:
 
@@ -26,18 +36,6 @@ ComfyUI/models/easyanimate/
 │   │
 │   ├───scheduler
 │   │       scheduler_config.json
-│   │
-│   ├───text_encoder
-│   │       config.json
-│   │       model.fp16-00001-of-00002.safetensors
-│   │       model.fp16-00002-of-00002.safetensors
-│   │       model.safetensors.index.json
-│   │
-│   ├───tokenizer
-│   │       added_tokens.json
-│   │       special_tokens_map.json
-│   │       spiece.model
-│   │       tokenizer_config.json
 │   │
 │   └───vae
 │           config.json
