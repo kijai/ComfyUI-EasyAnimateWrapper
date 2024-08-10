@@ -203,6 +203,8 @@ class EasyAnimateSampler:
 
     def process(self, easyanimate_pipeline, positive, negative, width, height, frames, cfg, steps, seed, scheduler, keep_model_loaded, 
                 image_start=None, image_end=None):
+        if image_start is None and image_end is not None:
+            raise ValueError("To use image_end, image_start must also be provided.")
         device = mm.get_torch_device()
         offload_device = mm.unet_offload_device()
         mm.unload_all_models()
@@ -210,7 +212,6 @@ class EasyAnimateSampler:
         dtype = easyanimate_pipeline['dtype']
         pipeline = easyanimate_pipeline['pipeline']
         
-
         model_name = easyanimate_pipeline['model_name']
         if "512" in model_name:
             base_resolution = 512
@@ -224,13 +225,16 @@ class EasyAnimateSampler:
 
         if image_start is not None:
             B, H, W, C = image_start.shape
-            image_start = clip_image = image_start.permute(0, 3, 1, 2).to(device)
             aspect_ratio_sample_size    = {key : [x / 512 * base_resolution for x in ASPECT_RATIO_512[key]] for key in ASPECT_RATIO_512.keys()}
             closest_size, closest_ratio = get_closest_ratio(H, W, ratios=aspect_ratio_sample_size)
             height, width = [int(x / 16) * 16 for x in closest_size]
             print("closest size: ", closest_size, " closest ratio: ", closest_ratio, " height: ", height, " width: ", width)
-
-            pixels = comfy.utils.common_upscale(image_start, width, height, "lanczos", "disabled")
+            image_start = clip_image = image_start.permute(0, 3, 1, 2).to(device)
+            if H != height or W != width:
+                print("Image dimensions not optimal, resizing to", height, width)
+                pixels = comfy.utils.common_upscale(image_start, width, height, "lanczos", "disabled")
+            else:
+                height, width = H, W
 
             input_video = torch.tile(
             pixels.unsqueeze(2),  # Permute B, H, W, C to B, C, H, W and unsqueeze T
@@ -241,7 +245,9 @@ class EasyAnimateSampler:
             input_video_mask[:, :, 1:] = 1
 
             if image_end is not None:
-                input_video[:, :, -1:] = image_end.permute(0, 3, 1, 2).unsqueeze(2).to(device)
+                image_end = image_end.permute(0, 3, 1, 2)
+                pixels = comfy.utils.common_upscale(image_end, width, height, "lanczos", "disabled")
+                input_video[:, :, -1:] = pixels.unsqueeze(2).to(device)
                 input_video_mask[:, :, -1:] = 0
         else:
             input_video = torch.zeros([1, 3, video_length, height, width])
@@ -289,6 +295,33 @@ class EasyAnimateSampler:
             gc.collect()
 
         return sample,
+
+class EasyAnimateResize:
+    @classmethod
+    def INPUT_TYPES(s):
+        return {"required": {
+                "image": ("IMAGE",),
+                "base_resolution": (["512", "768", "960"],),
+            },
+        }
+
+    RETURN_TYPES = ("IMAGE",)
+    RETURN_NAMES = ("image",)
+    FUNCTION = "process"
+    CATEGORY = "EasyAnimateWrapper"
+
+    def process(self, image, base_resolution):
+       
+        B, H, W, C = image.shape
+        aspect_ratio_sample_size    = {key : [x / 512 * int(base_resolution) for x in ASPECT_RATIO_512[key]] for key in ASPECT_RATIO_512.keys()}
+        closest_size, closest_ratio = get_closest_ratio(H, W, ratios=aspect_ratio_sample_size)
+        height, width = [int(x / 16) * 16 for x in closest_size]
+        print("closest size: ", closest_size, " closest ratio: ", closest_ratio, " height: ", height, " width: ", width)
+        image_resized = image.permute(0, 3, 1, 2)
+        image_resized = comfy.utils.common_upscale(image_resized, width, height, "lanczos", "disabled")
+        image_resized = image_resized.permute(0, 2, 3, 1)
+           
+        return image_resized,
 
 class EasyAnimateTextEncodeOrig:
     @classmethod
@@ -443,11 +476,13 @@ NODE_CLASS_MAPPINGS = {
     "DownloadAndLoadEasyAnimateModel": DownloadAndLoadEasyAnimateModel,
     "EasyAnimateSampler": EasyAnimateSampler,
     "EasyAnimateTextEncode": EasyAnimateTextEncode,
-    "EasyAnimateDecode": EasyAnimateDecode
+    "EasyAnimateDecode": EasyAnimateDecode,
+    "EasyAnimateResize": EasyAnimateResize
 }
 NODE_DISPLAY_NAME_MAPPINGS = {
     "DownloadAndLoadEasyAnimateModel": "(Down)Load EasyAnimate Model",
     "EasyAnimateSampler": "EasyAnimate Sampler",
     "EasyAnimateTextEncode": "EasyAnimate Text Encode",
-    "EasyAnimateDecode": "EasyAnimate Decode"
+    "EasyAnimateDecode": "EasyAnimate Decode",
+    "EasyAnimateResize": "EasyAnimate Resize"
 }
