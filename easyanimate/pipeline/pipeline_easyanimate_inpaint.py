@@ -30,7 +30,6 @@ from diffusers.utils import logging
 from diffusers.utils.torch_utils import randn_tensor
 from einops import rearrange
 from tqdm import tqdm
-from transformers import CLIPVisionModelWithProjection,  CLIPImageProcessor
 
 from ..models.transformer3d import Transformer3DModel
 from comfy.utils import ProgressBar
@@ -57,10 +56,6 @@ class EasyAnimateInpaintPipeline(DiffusionPipeline):
     Args:
         vae ([`AutoencoderKL`]):
             Variational Auto-Encoder (VAE) Model to encode and decode images to and from latent representations.
-        text_encoder ([`T5EncoderModel`]):
-            Frozen text-encoder. PixArt-Alpha uses
-            [T5](https://huggingface.co/docs/transformers/model_doc/t5#transformers.T5EncoderModel), specifically the
-            [t5-v1_1-xxl](https://huggingface.co/PixArt-alpha/PixArt-alpha/tree/main/t5-v1_1-xxl) variant.
         tokenizer (`T5Tokenizer`):
             Tokenizer of class
             [T5Tokenizer](https://huggingface.co/docs/transformers/model_doc/t5#transformers.T5Tokenizer).
@@ -69,10 +64,6 @@ class EasyAnimateInpaintPipeline(DiffusionPipeline):
         scheduler ([`SchedulerMixin`]):
             A scheduler to be used in combination with `transformer` to denoise the encoded image latents.
     """
-    bad_punct_regex = re.compile(
-        r"[" + "#®•©™&@·º½¾¿¡§~" + "\)" + "\(" + "\]" + "\[" + "\}" + "\{" + "\|" + "\\" + "\/" + "\*" + r"]{1,}"
-    )  # noqa
-
     _optional_components = ["tokenizer", "text_encoder"]
     model_cpu_offload_seq = "text_encoder->transformer->vae"
 
@@ -80,19 +71,17 @@ class EasyAnimateInpaintPipeline(DiffusionPipeline):
         self,
         vae: AutoencoderKL,
         transformer: Transformer3DModel,
-        scheduler: DPMSolverMultistepScheduler,
-        clip_image_processor:CLIPImageProcessor = None,
-        clip_image_encoder:CLIPVisionModelWithProjection = None,
+        scheduler: DPMSolverMultistepScheduler
     ):
         super().__init__()
 
         self.register_modules(
-            vae=vae, transformer=transformer, 
-            scheduler=scheduler,
-            clip_image_processor=clip_image_processor, clip_image_encoder=clip_image_encoder,
+            vae=vae, 
+            transformer=transformer, 
+            scheduler=scheduler
         )
 
-        self.vae_scale_factor = 2 ** (len(self.vae.config.block_out_channels) - 1)
+        self.vae_scale_factor = 8
         self.image_processor = VaeImageProcessor(vae_scale_factor=self.vae_scale_factor, do_normalize=True)
         self.mask_processor = VaeImageProcessor(
             vae_scale_factor=self.vae_scale_factor, do_normalize=False, do_binarize=True, do_convert_grayscale=True
@@ -149,6 +138,7 @@ class EasyAnimateInpaintPipeline(DiffusionPipeline):
         is_strength_max=True,
         return_noise=False,
         return_video_latents=False,
+        input_video=None,
     ):
         if self.vae.quant_conv.weight.ndim==5:
             mini_batch_encoder = self.vae.mini_batch_encoder
@@ -164,6 +154,8 @@ class EasyAnimateInpaintPipeline(DiffusionPipeline):
             )
 
         if return_video_latents or (latents is None and not is_strength_max):
+            if input_video is not None:
+                video = input_video
             video = video.to(device=device, dtype=self.vae.dtype)
             if self.vae.quant_conv.weight.ndim==5:
                 bs = 1
@@ -360,6 +352,7 @@ class EasyAnimateInpaintPipeline(DiffusionPipeline):
         self,
         video_length: Optional[int] = None,
         video: Union[torch.FloatTensor] = None,
+        input_video: Optional[torch.FloatTensor] = None,
         mask_video: Union[torch.FloatTensor] = None,
         masked_video_latents: Union[torch.FloatTensor] = None,
         num_inference_steps: int = 20,
@@ -383,7 +376,7 @@ class EasyAnimateInpaintPipeline(DiffusionPipeline):
         clean_caption: bool = True,
         mask_feature: bool = True,
         max_sequence_length: int = 120,
-        clip_image: Image = None,
+        image_embeds: Optional[torch.Tensor] = None,
         clip_apply_ratio: float = 0.50,
     ):
         """
@@ -521,6 +514,7 @@ class EasyAnimateInpaintPipeline(DiffusionPipeline):
             is_strength_max=is_strength_max,
             return_noise=True,
             return_video_latents=return_image_latents,
+            input_video=input_video
         )
         if return_image_latents:
             latents, noise, image_latents = latents_outputs
@@ -582,11 +576,9 @@ class EasyAnimateInpaintPipeline(DiffusionPipeline):
                 mask = F.interpolate(mask, size=latents.size()[-3:], mode='trilinear', align_corners=True).to(latents.device, latents.dtype)
 
                 inpaint_latents = None
-    
-        if clip_image is not None:
-            inputs = self.clip_image_processor(images=clip_image, return_tensors="pt")
-            inputs["pixel_values"] = inputs["pixel_values"].to(latents.device, dtype=latents.dtype)
-            clip_encoder_hidden_states = self.clip_image_encoder(**inputs).image_embeds
+
+        if image_embeds is not None:
+            clip_encoder_hidden_states = image_embeds
             clip_encoder_hidden_states_neg = torch.zeros([batch_size, 768]).to(latents.device, dtype=latents.dtype)
 
             clip_attention_mask = torch.ones([batch_size, 8]).to(latents.device, dtype=latents.dtype)
@@ -595,7 +587,7 @@ class EasyAnimateInpaintPipeline(DiffusionPipeline):
             clip_encoder_hidden_states_input = torch.cat([clip_encoder_hidden_states_neg, clip_encoder_hidden_states]) if do_classifier_free_guidance else clip_encoder_hidden_states
             clip_attention_mask_input = torch.cat([clip_attention_mask_neg, clip_attention_mask]) if do_classifier_free_guidance else clip_attention_mask
 
-        elif clip_image is None and num_channels_transformer == 12:
+        elif image_embeds is None and num_channels_transformer == 12:
             clip_encoder_hidden_states = torch.zeros([batch_size, 768]).to(latents.device, dtype=latents.dtype)
 
             clip_attention_mask = torch.zeros([batch_size, 8])

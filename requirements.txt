@@ -2,7 +2,7 @@ Pillow
 einops
 timm
 accelerate
-numpy
+numpy<=1.26.4
 opencv-python
 omegaconf
 SentencePiece

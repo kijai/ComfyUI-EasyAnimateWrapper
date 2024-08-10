@@ -9,7 +9,6 @@ from diffusers import (DDIMScheduler,
                        EulerAncestralDiscreteScheduler, EulerDiscreteScheduler,
                        PNDMScheduler)
 from omegaconf import OmegaConf
-from transformers import CLIPVisionModelWithProjection, CLIPImageProcessor
 
 from .easyanimate.models.autoencoder_magvit import AutoencoderKLMagvit
 from .easyanimate.models.transformer3d import Transformer3DModel
@@ -88,10 +87,14 @@ class DownloadAndLoadEasyAnimateModel:
 
             pbar.update(1)
 
-        transformer_config = Transformer3DModel.load_config(os.path.join(script_directory, "config", "transformer_config.json"))
+        if "960" in model:
+            transformer_config = Transformer3DModel.load_config(os.path.join(script_directory, "config", "transformer_config_960.json"))
+        else:
+            transformer_config = Transformer3DModel.load_config(os.path.join(script_directory, "config", "transformer_config.json"))
         transformer_additional_kwargs = OmegaConf.to_container(config['transformer_additional_kwargs'])
         transformer_config.update(transformer_additional_kwargs)
 
+        print("Loading transformers model...")
         with (init_empty_weights()):
             self.transformer = Transformer3DModel.from_config(transformer_config)
 
@@ -99,15 +102,18 @@ class DownloadAndLoadEasyAnimateModel:
         for key in sd:
             set_module_tensor_to_device(self.transformer, key, dtype=dtype, device=device, value=sd[key])
         del sd
-
         pbar.update(1)
 
-        vae = AutoencoderKLMagvit.from_pretrained(common_path, subfolder="vae").to(dtype)
+        print("Loading vae model...")
+        vae_config = OmegaConf.load(os.path.join(script_directory, "config", "vae_config.json"))
+        with (init_empty_weights()):
+            vae = AutoencoderKLMagvit(**vae_config)
+        vae_sd = comfy.utils.load_torch_file(os.path.join(common_path, "vae", "diffusion_pytorch_model.safetensors"))
+        for key in vae_sd:
+            if 'loss' not in key:
+                set_module_tensor_to_device(vae, key, dtype=dtype, device=device, value=vae_sd[key])
+
         vae.upcast_vae = True
-
-        clip_image_encoder = CLIPVisionModelWithProjection.from_pretrained(common_path, subfolder="image_encoder").to(device, dtype)
-        clip_image_processor = CLIPImageProcessor.from_pretrained(common_path, subfolder="image_encoder")
-
         pbar.update(1)
 
         scheduler = DPMSolverMultistepScheduler(**OmegaConf.to_container(config['noise_scheduler_kwargs']))
@@ -115,8 +121,6 @@ class DownloadAndLoadEasyAnimateModel:
             vae=vae,
             transformer=self.transformer,
             scheduler=scheduler,
-            clip_image_encoder=clip_image_encoder,
-            clip_image_processor=clip_image_processor,
         )
 
         if low_gpu_memory_mode:
@@ -186,12 +190,14 @@ class EasyAnimateSampler:
                 "PNDMScheduler",
                 "DDIMScheduler",
             ],),
-           
+            "denoise_strength": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 1.0, "step": 0.01}),
             "keep_model_loaded": ("BOOLEAN", {"default": True}),
             },
             "optional": {
+                "image_embeds": ("CLIP_VISION_IMAGE_EMBEDS",),
                 "image_start": ("IMAGE",),
                 "image_end": ("IMAGE",),
+                "full_input_video": ("IMAGE",),
                
             }
         }
@@ -201,8 +207,8 @@ class EasyAnimateSampler:
     FUNCTION = "process"
     CATEGORY = "EasyAnimateWrapper"
 
-    def process(self, easyanimate_pipeline, positive, negative, width, height, frames, cfg, steps, seed, scheduler, keep_model_loaded, 
-                image_start=None, image_end=None):
+    def process(self, easyanimate_pipeline, positive, negative, width, height, frames, cfg, steps, seed, scheduler, keep_model_loaded, denoise_strength,
+                image_start=None, image_end=None, full_input_video=None, image_embeds=None):
         if image_start is None and image_end is not None:
             raise ValueError("To use image_end, image_start must also be provided.")
         device = mm.get_torch_device()
@@ -223,17 +229,26 @@ class EasyAnimateSampler:
         vae = pipeline.vae
         video_length = int(frames // vae.mini_batch_encoder * vae.mini_batch_encoder) if frames != 1 else 1
 
+        if image_embeds is not None:
+            image_embeds = image_embeds.to(dtype).to(device)
+
+        if full_input_video is not None:
+            full_input_video = full_input_video.permute(3, 0, 1, 2).to(device).unsqueeze(0) # B, C, T, H, W
+            full_input_video = full_input_video * 2.0 - 1.0
+            video_length = full_input_video.shape[2]
+
         if image_start is not None:
             B, H, W, C = image_start.shape
             aspect_ratio_sample_size    = {key : [x / 512 * base_resolution for x in ASPECT_RATIO_512[key]] for key in ASPECT_RATIO_512.keys()}
             closest_size, closest_ratio = get_closest_ratio(H, W, ratios=aspect_ratio_sample_size)
             height, width = [int(x / 16) * 16 for x in closest_size]
             print("closest size: ", closest_size, " closest ratio: ", closest_ratio, " height: ", height, " width: ", width)
-            image_start = clip_image = image_start.permute(0, 3, 1, 2).to(device)
+            image_start = image_start.permute(0, 3, 1, 2).to(device)
             if H != height or W != width:
                 print("Image dimensions not optimal, resizing to", height, width)
                 pixels = comfy.utils.common_upscale(image_start, width, height, "lanczos", "disabled")
             else:
+                pixels = image_start
                 height, width = H, W
 
             input_video = torch.tile(
@@ -252,8 +267,6 @@ class EasyAnimateSampler:
         else:
             input_video = torch.zeros([1, 3, video_length, height, width])
             input_video_mask = torch.ones([1, 1, video_length, height, width])
-            clip_image = None
-
 
         generator = torch.Generator(device=device).manual_seed(seed)
         model_path = easyanimate_pipeline['model_path']
@@ -278,6 +291,7 @@ class EasyAnimateSampler:
             prompt_attention_mask = positive["attention_mask"].to(dtype).to(device),
             negative_prompt_embeds = negative["embeds"].to(dtype).to(device),
             negative_prompt_attention_mask = negative["attention_mask"].to(dtype).to(device),
+            image_embeds = image_embeds,
             height = height,
             width = width,
             generator = generator,
@@ -285,7 +299,8 @@ class EasyAnimateSampler:
             num_inference_steps = steps,
             video = input_video,
             mask_video = input_video_mask,
-            clip_image = clip_image,
+            strength = denoise_strength,
+            input_video = full_input_video,
         )
 
         if not keep_model_loaded:
@@ -295,6 +310,28 @@ class EasyAnimateSampler:
             gc.collect()
 
         return sample,
+
+class EasyAnimateImageEncoder:
+    @classmethod
+    def INPUT_TYPES(s):
+        return {"required": {
+                "image": ("IMAGE",),
+                "strength": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 10.0, "step": 0.01}),
+            },
+        }
+
+    RETURN_TYPES = ("CLIP_VISION_IMAGE_EMBEDS",)
+    RETURN_NAMES = ("image_embeds",)
+    FUNCTION = "process"
+    CATEGORY = "EasyAnimateWrapper"
+
+    def process(self, image, strength):
+       
+        clip_path = os.path.join(folder_paths.models_dir, "easyanimate", "common", "image_encoder", "pytorch_model.bin")
+        clip_vision = comfy.clip_vision.load(clip_path)
+        image_embeds = clip_vision.encode_image(image)['image_embeds']
+           
+        return image_embeds * strength,
 
 class EasyAnimateResize:
     @classmethod
@@ -477,12 +514,14 @@ NODE_CLASS_MAPPINGS = {
     "EasyAnimateSampler": EasyAnimateSampler,
     "EasyAnimateTextEncode": EasyAnimateTextEncode,
     "EasyAnimateDecode": EasyAnimateDecode,
-    "EasyAnimateResize": EasyAnimateResize
+    "EasyAnimateResize": EasyAnimateResize,
+    "EasyAnimateImageEncoder": EasyAnimateImageEncoder
 }
 NODE_DISPLAY_NAME_MAPPINGS = {
     "DownloadAndLoadEasyAnimateModel": "(Down)Load EasyAnimate Model",
     "EasyAnimateSampler": "EasyAnimate Sampler",
     "EasyAnimateTextEncode": "EasyAnimate Text Encode",
     "EasyAnimateDecode": "EasyAnimate Decode",
-    "EasyAnimateResize": "EasyAnimate Resize"
+    "EasyAnimateResize": "EasyAnimate Resize",
+    "EasyAnimateImageEncoder": "EasyAnimate Image Encoder"
 }
