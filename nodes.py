@@ -163,6 +163,9 @@ class EasyAnimateTextEncode:
         clip.cond_stage_model.t5xxl.to(device)
         embeds, _, attention_mask = clip.cond_stage_model.t5xxl.encode_token_weights(tokens)
         clip.cond_stage_model.t5xxl.to(offload_device)
+        
+        if embeds.shape[1] > 120:
+            raise ValueError("Prompt too long, currently must 120 tokens or less, got {}".format(embeds.shape[1]))
         embeds = {
             "embeds": embeds,
             "attention_mask": attention_mask['attention_mask']
