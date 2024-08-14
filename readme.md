@@ -46,3 +46,6 @@ ComfyUI/models/easyanimate/
         EasyAnimateV3-XL-2-InP-768x768-bf16.safetensors
         EasyAnimateV3-XL-2-InP-960x960-bf16.safetensors
 ```
+Original repo:
+
+https://github.com/aigc-apps/EasyAnimate
